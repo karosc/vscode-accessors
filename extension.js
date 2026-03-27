@@ -12,6 +12,7 @@ const {
   extractSignatureCall,
   parseDisplaySignature,
   parseKnownHostType,
+  parseKnownHostTypes,
   resolveKnownHostTypeExpression
 } = require("./lib/overlay");
 
@@ -723,21 +724,30 @@ async function buildAccessorCompletionItems(
   replaceRange
 ) {
   const hostExpression = reference.parts.join(".");
-  const hostType = await resolveExpressionType(
+  const hostTypes = await resolveExpressionTypes(
     document,
     hostExpression,
     position,
     report,
     true
   );
-  if (!hostType) {
+  if (hostTypes.length === 0) {
     return [];
   }
 
+  const hostTypeSet = new Set(hostTypes);
   const partialLower = reference.partial.toLowerCase();
+  const seenAccessorNames = new Set();
   return report.accessors
-    .filter((accessor) => accessor.host_type === hostType)
+    .filter((accessor) => hostTypeSet.has(accessor.host_type))
     .filter((accessor) => accessor.accessor_name.toLowerCase().startsWith(partialLower))
+    .filter((accessor) => {
+      if (seenAccessorNames.has(accessor.accessor_name)) {
+        return false;
+      }
+      seenAccessorNames.add(accessor.accessor_name);
+      return true;
+    })
     .map((accessor) => createAccessorCompletionItem(accessor, replaceRange));
 }
 
@@ -754,26 +764,35 @@ async function buildMemberCompletionItems(
 
   const accessorName = reference.parts.at(-1);
   const hostExpression = reference.parts.slice(0, -1).join(".");
-  const hostType = await resolveExpressionType(
+  const hostTypes = await resolveExpressionTypes(
     document,
     hostExpression,
     position,
     report,
     true
   );
-  if (!hostType) {
-    return [];
-  }
-
-  const accessor = findAccessor(report, hostType, accessorName);
-  if (!accessor) {
+  if (hostTypes.length === 0) {
     return [];
   }
 
   const partialLower = reference.partial.toLowerCase();
-  return accessor.members
-    .filter((member) => member.name.toLowerCase().startsWith(partialLower))
-    .map((member) => createMemberCompletionItem(accessor, member, replaceRange));
+  const seenMemberNames = new Set();
+  const matchingAccessors = hostTypes
+    .map((hostType) => findAccessor(report, hostType, accessorName))
+    .filter(Boolean);
+
+  return matchingAccessors.flatMap((accessor) =>
+    accessor.members
+      .filter((member) => member.name.toLowerCase().startsWith(partialLower))
+      .filter((member) => {
+        if (seenMemberNames.has(member.name)) {
+          return false;
+        }
+        seenMemberNames.add(member.name);
+        return true;
+      })
+      .map((member) => createMemberCompletionItem(accessor, member, replaceRange))
+  );
 }
 
 async function provideHover(analysisService, document, position) {
@@ -821,20 +840,17 @@ async function provideDefinition(analysisService, document, position) {
   );
   const report = await analysisService.getReport(document, position);
   if (reference) {
-    const resolved = await resolveReferencedItem(
+    const resolvedItems = await resolveReferencedItems(
       document,
       position,
       report,
       reference,
       true
     );
-    if (resolved) {
-      const target = resolved.member || resolved.accessor;
-      const filePath = target.file_path || resolved.accessor.file_path;
-      return new vscode.Location(
-        vscode.Uri.file(filePath),
-        new vscode.Position(Math.max(target.line - 1, 0), 0)
-      );
+    if (resolvedItems.length > 0) {
+      return resolvedItems
+        .map((resolved) => locationForResolvedAccessorTarget(resolved))
+        .filter(Boolean);
     }
   }
 
@@ -878,43 +894,70 @@ async function resolveReferencedItem(
   reference,
   allowHoverFallback
 ) {
+  const resolvedItems = await resolveReferencedItems(
+    document,
+    position,
+    report,
+    reference,
+    allowHoverFallback
+  );
+  return resolvedItems[0] || null;
+}
+
+async function resolveReferencedItems(
+  document,
+  position,
+  report,
+  reference,
+  allowHoverFallback
+) {
+  const matches = [];
+
   if (reference.tokenIndex >= 2) {
     const accessorName = reference.parts[reference.tokenIndex - 1];
     const hostExpression = reference.parts.slice(0, reference.tokenIndex - 1).join(".");
-    const hostType = await resolveExpressionType(
+    const hostTypes = await resolveExpressionTypes(
       document,
       hostExpression,
       position,
       report,
       allowHoverFallback
     );
-    const accessor = findAccessor(report, hostType, accessorName);
-    if (accessor) {
+    for (const hostType of hostTypes) {
+      const accessor = findAccessor(report, hostType, accessorName);
+      if (!accessor) {
+        continue;
+      }
       const member = accessor.members.find(
         (candidate) => candidate.name === reference.parts[reference.tokenIndex]
       );
       if (member) {
-        return { accessor, member };
+        matches.push({ accessor, member });
       }
+    }
+    if (matches.length > 0) {
+      return dedupeResolvedItems(matches);
     }
   }
 
   if (reference.tokenIndex >= 1) {
     const hostExpression = reference.parts.slice(0, reference.tokenIndex).join(".");
-    const hostType = await resolveExpressionType(
+    const hostTypes = await resolveExpressionTypes(
       document,
       hostExpression,
       position,
       report,
       allowHoverFallback
     );
-    const accessor = findAccessor(report, hostType, reference.parts[reference.tokenIndex]);
-    if (accessor) {
-      return { accessor, member: null };
+    for (const hostType of hostTypes) {
+      const accessor = findAccessor(report, hostType, reference.parts[reference.tokenIndex]);
+      if (accessor) {
+        matches.push({ accessor, member: null });
+      }
     }
   }
 
-  return null;
+  return dedupeResolvedItems(matches);
 }
 
 async function resolveExpressionType(
@@ -924,12 +967,30 @@ async function resolveExpressionType(
   report,
   allowHoverFallback
 ) {
+  const hostTypes = await resolveExpressionTypes(
+    document,
+    expression,
+    position,
+    report,
+    allowHoverFallback
+  );
+  return hostTypes[0] || null;
+}
+
+async function resolveExpressionTypes(
+  document,
+  expression,
+  position,
+  report,
+  allowHoverFallback
+) {
   if (!expression) {
-    return null;
+    return [];
   }
 
-  if (report.symbol_types && report.symbol_types[expression]) {
-    return report.symbol_types[expression];
+  const directType = report.symbol_types && report.symbol_types[expression];
+  if (directType) {
+    return parseKnownHostTypes(directType);
   }
 
   const aliasResolvedType = resolveKnownHostTypeExpression(
@@ -937,11 +998,11 @@ async function resolveExpressionType(
     report.scope_aliases || {}
   );
   if (aliasResolvedType) {
-    return aliasResolvedType;
+    return [aliasResolvedType];
   }
 
   if (!allowHoverFallback) {
-    return null;
+    return [];
   }
 
   const linePrefix = document.lineAt(position.line).text.slice(0, position.character);
@@ -959,7 +1020,7 @@ async function resolveExpressionType(
     document.uri,
     hoverPosition
   );
-  return parseKnownHostType(flattenHoverContents(hovers));
+  return parseKnownHostTypes(flattenHoverContents(hovers));
 }
 
 function flattenHoverContents(hovers) {
@@ -991,6 +1052,37 @@ function findAccessor(report, hostType, accessorName) {
       (accessor) =>
         accessor.host_type === hostType && accessor.accessor_name === accessorName
     ) || null
+  );
+}
+
+function dedupeResolvedItems(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const target = item.member || item.accessor;
+    const key = [
+      target.file_path || item.accessor.file_path || "",
+      target.line || item.accessor.line || 0,
+      item.accessor.host_type,
+      item.accessor.accessor_name,
+      item.member?.name || ""
+    ].join("::");
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function locationForResolvedAccessorTarget(resolved) {
+  const target = resolved.member || resolved.accessor;
+  const filePath = target.file_path || resolved.accessor.file_path;
+  if (!filePath) {
+    return null;
+  }
+  return new vscode.Location(
+    vscode.Uri.file(filePath),
+    new vscode.Position(Math.max(target.line - 1, 0), 0)
   );
 }
 

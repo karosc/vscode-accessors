@@ -10,6 +10,7 @@ const {
   extractSignatureCall,
   parseDisplaySignature,
   parseKnownHostType,
+  parseKnownHostTypes,
   resolveExpressionAlias,
   resolveKnownHostTypeExpression
 } = require("../lib/overlay");
@@ -120,6 +121,17 @@ test("parseKnownHostType recognizes short and fully qualified names", () => {
   assert.equal(
     parseKnownHostType("```python\n(variable) df: pandas.DataFrame\n```"),
     "pandas.DataFrame"
+  );
+});
+
+test("parseKnownHostTypes preserves unions in hover text", () => {
+  assert.deepEqual(
+    parseKnownHostTypes("(variable) da: Dataset | DataArray"),
+    ["xarray.Dataset", "xarray.DataArray"]
+  );
+  assert.deepEqual(
+    parseKnownHostTypes("```python\n(variable) value: pandas.Series | pandas.Index\n```"),
+    ["pandas.Series", "pandas.Index"]
   );
 });
 
