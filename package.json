@@ -2,7 +2,7 @@
   "name": "accessor-discovery-prototype",
   "displayName": "Accessor Discovery",
   "description": "Completion, hover, and definition support for xarray and pandas accessors in Python.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "karosc",
   "preview": true,
   "markdown": "github",
