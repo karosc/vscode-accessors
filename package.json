@@ -1,20 +1,44 @@
 {
   "name": "accessor-discovery-prototype",
-  "displayName": "Accessor Discovery Prototype",
-  "description": "Prototype VS Code extension for statically discovering xarray and pandas accessors through recursive import analysis.",
+  "displayName": "Accessor Discovery",
+  "description": "Completion, hover, and definition support for xarray and pandas accessors in Python.",
   "version": "0.0.1",
   "publisher": "local",
+  "preview": true,
+  "markdown": "github",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/karosc/vscode-accessors.git"
+  },
+  "homepage": "https://github.com/karosc/vscode-accessors#readme",
+  "bugs": {
+    "url": "https://github.com/karosc/vscode-accessors/issues"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
     "Other"
   ],
+  "keywords": [
+    "python",
+    "xarray",
+    "pandas",
+    "accessor",
+    "autocomplete",
+    "hover",
+    "definition",
+    "data-science"
+  ],
+  "galleryBanner": {
+    "color": "#12344d",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onCommand:accessor.analyzeCurrentFile",
     "onLanguage:python"
   ],
-  "main": "./extension.js",
+  "main": "./extension/extension.js",
   "contributes": {
     "commands": [
       {
