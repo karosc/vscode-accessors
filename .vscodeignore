@@ -1,0 +1,6 @@
+.git/**
+.vscode/**
+tests/**
+**/__pycache__/**
+PUBLISHING.md
+*.vsix

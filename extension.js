@@ -1,5 +1,6 @@
 "use strict";
 
+const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const vscode = require("vscode");
@@ -23,7 +24,7 @@ const COMPLETION_TRIGGER_SET = new Set(COMPLETION_TRIGGERS);
 function activate(context) {
   const output = vscode.window.createOutputChannel("Accessor Discovery");
   const analysisService = new AnalysisService(context, output);
-  context.subscriptions.push(output);
+  context.subscriptions.push(output, { dispose: () => analysisService.dispose() });
   const schedulePrefetch = (document, position) => {
     if (document && document.languageId === "python") {
       analysisService.prefetch(document, position);
@@ -50,6 +51,7 @@ function activate(context) {
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("accessor") || event.affectsConfiguration("python")) {
         analysisService.invalidateAll();
+        analysisService.resetWorker();
       }
     })
   );
@@ -133,6 +135,8 @@ function activate(context) {
     vscode.window.activeTextEditor?.document || null,
     vscode.window.activeTextEditor?.selection.active || null
   );
+
+  activatePythonExtensionWatcher(analysisService, context);
 }
 
 function deactivate() {}
@@ -141,8 +145,18 @@ class AnalysisService {
   constructor(context, output) {
     this.context = context;
     this.output = output;
-    this.cache = new Map();
+    this.localCache = new Map();
+    this.discoveryCache = new Map();
+    this.scopeCache = new Map();
+    this.localPending = new Map();
+    this.discoveryPending = new Map();
+    this.scopePending = new Map();
     this.prefetchTimers = new Map();
+    this.interpreterRefreshTimers = new Map();
+    this.workerClient = new HelperWorkerClient(context, output);
+    this.pythonApiPromise = null;
+    this.lastPythonCandidatesKey = "";
+    this.activeEnvironmentOverrides = new Map();
   }
 
   async getReport(document, position = null) {
@@ -151,53 +165,297 @@ class AnalysisService {
       throw new Error("The current file must be inside a workspace folder.");
     }
 
-    const pythonCandidates = getPythonCandidates(workspaceFolder);
+    const pythonCandidates = await this.getPythonCandidates(workspaceFolder, document.uri);
     const lineKey = position ? position.line + 1 : 0;
-    const cacheKey = `${document.uri.toString()}::${lineKey}`;
-    const cached = this.cache.get(cacheKey);
+    const localReport = await this.getLocalReport(
+      workspaceFolder,
+      document,
+      pythonCandidates
+    );
+    const discoveryReport = await this.getDiscoveryReport(
+      workspaceFolder,
+      document,
+      pythonCandidates,
+      localReport
+    );
+    const scopeReport = await this.getScopeReport(
+      workspaceFolder,
+      document,
+      pythonCandidates,
+      lineKey || document.lineCount
+    );
+    return mergeReports(localReport, discoveryReport, scopeReport);
+  }
+
+  async getPythonCandidates(workspaceFolder, resourceUri) {
+    const result = await getPythonCandidates(
+      workspaceFolder,
+      resourceUri,
+      () => this.getPythonApi(),
+      this.getActiveEnvironmentOverride(workspaceFolder, resourceUri)
+    );
+    const candidates = result.candidates;
+    const logKey = JSON.stringify({
+      workspace: workspaceFolder.uri.toString(),
+      resource: resourceUri.toString(),
+      candidates,
+      details: result.details
+    });
+    if (this.lastPythonCandidatesKey !== logKey) {
+      this.lastPythonCandidatesKey = logKey;
+      this.output.appendLine(
+        `Python helper candidates for ${resourceUri.fsPath}: ${
+          candidates.length > 0 ? candidates.join(", ") : "(none)"
+        }`
+      );
+      for (const detail of result.details) {
+        this.output.appendLine(`  - ${detail}`);
+      }
+    }
+    return candidates;
+  }
+
+  async getPythonApi() {
+    if (!this.pythonApiPromise) {
+      this.pythonApiPromise = activatePythonExtensionApi(this);
+    }
+    return this.pythonApiPromise;
+  }
+
+  getActiveEnvironmentOverride(workspaceFolder, resourceUri) {
+    const resourceKey = getResourceScopeKey(resourceUri);
+    if (resourceKey && this.activeEnvironmentOverrides.has(resourceKey)) {
+      return {
+        path: this.activeEnvironmentOverrides.get(resourceKey),
+        source: `event override for resource ${resourceUri.fsPath}`
+      };
+    }
+
+    const workspaceKey = getResourceScopeKey(workspaceFolder);
+    if (workspaceKey && this.activeEnvironmentOverrides.has(workspaceKey)) {
+      return {
+        path: this.activeEnvironmentOverrides.get(workspaceKey),
+        source: `event override for workspace ${workspaceFolder.uri.fsPath}`
+      };
+    }
+
+    if (this.activeEnvironmentOverrides.has("__default__")) {
+      return {
+        path: this.activeEnvironmentOverrides.get("__default__"),
+        source: "event override for workspace default"
+      };
+    }
+
+    return null;
+  }
+
+  recordActiveEnvironmentChange(resource, pathValue) {
+    const key = getResourceScopeKey(resource) || "__default__";
+    this.activeEnvironmentOverrides.set(key, pathValue);
+    this.lastPythonCandidatesKey = "";
+  }
+
+  clearActiveEnvironmentOverride(resource) {
+    const key = getResourceScopeKey(resource) || "__default__";
+    this.activeEnvironmentOverrides.delete(key);
+    this.lastPythonCandidatesKey = "";
+  }
+
+  refreshOpenPythonEditors(resource) {
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (editor.document.languageId !== "python") {
+        continue;
+      }
+      if (!resourceMatchesDocument(resource, editor.document)) {
+        continue;
+      }
+      this.prefetch(editor.document, editor.selection.active);
+    }
+  }
+
+  scheduleInterpreterRefresh(resource, reason) {
+    const key = getResourceScopeKey(resource) || "__default__";
+    const existing = this.interpreterRefreshTimers.get(key);
+    if (existing) {
+      for (const timer of existing) {
+        clearTimeout(timer);
+      }
+    }
+
+    const delays = [0, 150, 500, 1200];
+    const timers = delays.map((delay, index) =>
+      setTimeout(() => {
+        this.clearActiveEnvironmentOverride(resource);
+        this.invalidateAll();
+        this.resetWorker();
+        this.refreshOpenPythonEditors(resource);
+        if (index === delays.length - 1) {
+          this.interpreterRefreshTimers.delete(key);
+        }
+      }, delay)
+    );
+    this.interpreterRefreshTimers.set(key, timers);
+  }
+
+  async getLocalReport(workspaceFolder, document, pythonCandidates) {
+    const cacheKey = document.uri.toString();
+    const pythonKey = pythonCandidates.join("::");
+    const cached = this.localCache.get(cacheKey);
     if (
       cached &&
       cached.version === document.version &&
-      cached.pythonKey === pythonCandidates.join("::")
+      cached.pythonKey === pythonKey
     ) {
       return cached.report;
+    }
+    if (this.localPending.has(cacheKey)) {
+      return this.localPending.get(cacheKey);
     }
 
     const scriptPath = path.join(
       this.context.extensionPath,
       "scripts",
-      "discover_accessors.py"
+      "discover_accessors_worker.py"
     );
     const args = [
-      scriptPath,
-      "--workspace",
-      workspaceFolder.uri.fsPath,
-      "--file",
-      document.uri.fsPath,
-      "--line",
-      String(lineKey || document.lineCount),
-      "--source-stdin",
-      "--json-indent",
-      "2"
+      scriptPath
     ];
+    const pending = this.workerClient
+      .request(pythonCandidates, args, {
+        mode: "local",
+        workspace: workspaceFolder.uri.fsPath,
+        file: document.uri.fsPath,
+        source: document.getText()
+      })
+      .then((report) => {
+        this.localCache.set(cacheKey, {
+          version: document.version,
+          pythonKey,
+          report
+        });
+        return report;
+      })
+      .finally(() => {
+        this.localPending.delete(cacheKey);
+      });
+    this.localPending.set(cacheKey, pending);
+    return pending;
+  }
 
-    const report = await runHelper(pythonCandidates, args, document.getText());
-    this.cache.set(cacheKey, {
-      version: document.version,
-      pythonKey: pythonCandidates.join("::"),
-      report
-    });
-    return report;
+  async getDiscoveryReport(workspaceFolder, document, pythonCandidates, localReport) {
+    const pythonKey = pythonCandidates.join("::");
+    const cacheKey = buildImportsCacheKey(document.uri.toString(), pythonKey, localReport);
+    const cached = this.discoveryCache.get(cacheKey);
+    if (cached) {
+      return cached.report;
+    }
+    if (this.discoveryPending.has(cacheKey)) {
+      return this.discoveryPending.get(cacheKey);
+    }
+
+    const scriptPath = path.join(
+      this.context.extensionPath,
+      "scripts",
+      "discover_accessors_worker.py"
+    );
+    const args = [scriptPath];
+    const pending = this.workerClient
+      .request(pythonCandidates, args, {
+        mode: "imports",
+        workspace: workspaceFolder.uri.fsPath,
+        file: document.uri.fsPath,
+        imports: localReport.imports || [],
+        current_package: localReport.current_package || ""
+      })
+      .then((report) => {
+        this.discoveryCache.set(cacheKey, { report });
+        return report;
+      })
+      .finally(() => {
+        this.discoveryPending.delete(cacheKey);
+      });
+    this.discoveryPending.set(cacheKey, pending);
+    return pending;
+  }
+
+  async getScopeReport(workspaceFolder, document, pythonCandidates, lineKey) {
+    const cacheKey = `${document.uri.toString()}::${lineKey}`;
+    const pythonKey = pythonCandidates.join("::");
+    const cached = this.scopeCache.get(cacheKey);
+    if (
+      cached &&
+      cached.version === document.version &&
+      cached.pythonKey === pythonKey
+    ) {
+      return cached.report;
+    }
+    if (this.scopePending.has(cacheKey)) {
+      return this.scopePending.get(cacheKey);
+    }
+
+    const scriptPath = path.join(
+      this.context.extensionPath,
+      "scripts",
+      "discover_accessors_worker.py"
+    );
+    const args = [
+      scriptPath
+    ];
+    const pending = this.workerClient
+      .request(pythonCandidates, args, {
+        mode: "scope",
+        workspace: workspaceFolder.uri.fsPath,
+        file: document.uri.fsPath,
+        line: lineKey,
+        source: document.getText()
+      })
+      .then((report) => {
+        this.scopeCache.set(cacheKey, {
+          version: document.version,
+          pythonKey,
+          report
+        });
+        return report;
+      })
+      .finally(() => {
+        this.scopePending.delete(cacheKey);
+      });
+    this.scopePending.set(cacheKey, pending);
+    return pending;
   }
 
   invalidate(key) {
-    this.cache.delete(key);
+    this.localCache.delete(key);
+    this.localPending.delete(key);
+    this.discoveryCache.delete(key);
+    this.scopeCache.delete(key);
+    this.discoveryPending.delete(key);
+    this.scopePending.delete(key);
   }
 
   invalidateDocument(uriKey) {
-    for (const key of this.cache.keys()) {
+    this.localCache.delete(uriKey);
+    this.localPending.delete(uriKey);
+    this.discoveryCache.delete(uriKey);
+    this.discoveryPending.delete(uriKey);
+    for (const key of this.discoveryCache.keys()) {
       if (key.startsWith(`${uriKey}::`)) {
-        this.cache.delete(key);
+        this.discoveryCache.delete(key);
+      }
+    }
+    for (const key of this.discoveryPending.keys()) {
+      if (key.startsWith(`${uriKey}::`)) {
+        this.discoveryPending.delete(key);
+      }
+    }
+    for (const key of this.scopeCache.keys()) {
+      if (key.startsWith(`${uriKey}::`)) {
+        this.scopeCache.delete(key);
+      }
+    }
+    for (const key of this.scopePending.keys()) {
+      if (key.startsWith(`${uriKey}::`)) {
+        this.scopePending.delete(key);
       }
     }
     const timer = this.prefetchTimers.get(uriKey);
@@ -208,11 +466,32 @@ class AnalysisService {
   }
 
   invalidateAll() {
-    this.cache.clear();
+    this.localCache.clear();
+    this.localPending.clear();
+    this.discoveryCache.clear();
+    this.scopeCache.clear();
+    this.discoveryPending.clear();
+    this.scopePending.clear();
     for (const timer of this.prefetchTimers.values()) {
       clearTimeout(timer);
     }
     this.prefetchTimers.clear();
+    for (const timers of this.interpreterRefreshTimers.values()) {
+      for (const timer of timers) {
+        clearTimeout(timer);
+      }
+    }
+    this.interpreterRefreshTimers.clear();
+    this.lastPythonCandidatesKey = "";
+  }
+
+  dispose() {
+    this.invalidateAll();
+    this.workerClient.dispose();
+  }
+
+  resetWorker() {
+    this.workerClient.dispose();
   }
 
   prefetch(document, position = null) {
@@ -231,6 +510,174 @@ class AnalysisService {
 
   async warm(document, position = null) {
     return this.getReport(document, position);
+  }
+}
+
+class HelperWorkerClient {
+  constructor(context, output) {
+    this.context = context;
+    this.output = output;
+    this.child = null;
+    this.command = null;
+    this.stderr = "";
+    this.stdoutBuffer = "";
+    this.nextRequestId = 1;
+    this.pending = new Map();
+    this.readyPromise = null;
+  }
+
+  async request(commands, args, payload) {
+    await this.ensureWorker(commands, args);
+    return new Promise((resolve, reject) => {
+      const id = this.nextRequestId;
+      this.nextRequestId += 1;
+      this.pending.set(id, { resolve, reject });
+      this.child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`);
+    });
+  }
+
+  async ensureWorker(commands, args) {
+    if (this.child && this.command && commands.includes(this.command)) {
+      return this.readyPromise;
+    }
+
+    this.disposeWorker();
+    const failures = [];
+    for (const command of commands) {
+      try {
+        await this.startWorker(command, args);
+        this.command = command;
+        return this.readyPromise;
+      } catch (error) {
+        failures.push(`${command}: ${String(error.message || error)}`);
+        this.disposeWorker();
+      }
+    }
+
+    throw new Error(`No usable Python interpreter found.\n${failures.join("\n")}`);
+  }
+
+  startWorker(command, args) {
+    this.output.appendLine(`Starting accessor helper worker with interpreter: ${command}`);
+    const child = spawn(command, ["-u", ...args], {
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    this.child = child;
+    this.command = command;
+    this.stderr = "";
+    this.stdoutBuffer = "";
+
+    this.readyPromise = new Promise((resolve, reject) => {
+      this.onReady = (message) => {
+        if (message?.type === "ready") {
+          this.onReady = null;
+          this.onReadyReject = null;
+          resolve();
+        }
+      };
+      this.onReadyReject = reject;
+    });
+
+    child.stdout.on("data", (chunk) => {
+      this.stdoutBuffer += chunk.toString();
+      this.drainStdout();
+    });
+    child.stderr.on("data", (chunk) => {
+      this.stderr += chunk.toString();
+    });
+    child.on("error", (error) => {
+      if (this.onReadyReject) {
+        this.onReadyReject(error);
+        this.onReadyReject = null;
+      }
+    });
+    child.on("close", (code) => {
+      const error = new Error(
+        this.stderr.trim() || `Accessor helper exited with code ${code}`
+      );
+      if (this.onReadyReject) {
+        this.onReadyReject(error);
+        this.onReadyReject = null;
+      }
+      this.rejectPending(error);
+      this.child = null;
+      this.command = null;
+      this.readyPromise = null;
+      this.onReady = null;
+    });
+
+    return this.readyPromise;
+  }
+
+  drainStdout() {
+    while (true) {
+      const newlineIndex = this.stdoutBuffer.indexOf("\n");
+      if (newlineIndex === -1) {
+        return;
+      }
+      const line = this.stdoutBuffer.slice(0, newlineIndex).trim();
+      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+      if (!line) {
+        continue;
+      }
+
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch (error) {
+        this.rejectPending(
+          new Error(`Invalid JSON output from helper worker: ${String(error.message || error)}`)
+        );
+        this.disposeWorker();
+        return;
+      }
+
+      if (message.type === "ready") {
+        if (this.onReady) {
+          this.onReady(message);
+        }
+        continue;
+      }
+
+      const pending = this.pending.get(message.id);
+      if (!pending) {
+        continue;
+      }
+      this.pending.delete(message.id);
+      if (message.ok) {
+        pending.resolve(message.result);
+        continue;
+      }
+      const error = new Error(message.error || "Accessor helper failed.");
+      error.kind = "helper";
+      pending.reject(error);
+    }
+  }
+
+  rejectPending(error) {
+    for (const pending of this.pending.values()) {
+      pending.reject(error);
+    }
+    this.pending.clear();
+    if (this.onReadyReject) {
+      this.onReadyReject(error);
+      this.onReadyReject = null;
+    }
+  }
+
+  disposeWorker() {
+    if (this.child) {
+      this.output.appendLine(`Stopping accessor helper worker for interpreter: ${this.command}`);
+      this.child.kill();
+    }
+    this.child = null;
+    this.command = null;
+    this.readyPromise = null;
+  }
+
+  dispose() {
+    this.rejectPending(new Error("Accessor helper worker stopped."));
+    this.disposeWorker();
   }
 }
 
@@ -676,7 +1123,7 @@ function buildAccessorMarkdown(accessor) {
     "python"
   );
   if (accessor.docstring) {
-    markdown.appendMarkdown(`\n\n${escapeMarkdown(accessor.docstring)}`);
+    appendDocstringMarkdown(markdown, accessor.docstring, true);
   }
   markdown.appendMarkdown(`\n\nModule: \`${accessor.module_name}\``);
   return markdown;
@@ -687,7 +1134,7 @@ function buildMemberMarkdown(accessor, member) {
   markdown.appendCodeblock(buildMemberCodeLabel(accessor, member), "python");
   markdown.appendMarkdown(`\n\nKind: \`${member.kind}\``);
   if (member.docstring) {
-    markdown.appendMarkdown(`\n\n${escapeMarkdown(member.docstring)}`);
+    appendDocstringMarkdown(markdown, member.docstring, true);
   }
   return markdown;
 }
@@ -695,7 +1142,7 @@ function buildMemberMarkdown(accessor, member) {
 function buildSignatureMarkdown(accessor, member) {
   const markdown = new vscode.MarkdownString();
   if (member.docstring) {
-    markdown.appendMarkdown(escapeMarkdown(member.docstring));
+    appendDocstringMarkdown(markdown, member.docstring, false);
   }
   markdown.appendMarkdown(`\n\nAccessor: \`${accessor.accessor_name}\``);
   return markdown;
@@ -721,60 +1168,258 @@ function buildMemberDetail(accessor, member) {
   return `${accessor.accessor_name}.${member.signature}`;
 }
 
-function escapeMarkdown(text) {
-  return text.replace(/([\\`*_{}[\]()#+\-.!])/g, "\\$1");
+function appendDocstringMarkdown(markdown, docstring, withLeadingSpacing) {
+  const rendered = String(docstring || "").trim();
+  if (!rendered) {
+    return;
+  }
+  markdown.appendMarkdown(withLeadingSpacing ? `\n\n${rendered}` : rendered);
 }
 
-function getPythonCandidates(workspaceFolder) {
-  const accessorConfig = vscode.workspace.getConfiguration("accessor", workspaceFolder.uri);
+async function getPythonCandidates(
+  workspaceFolder,
+  resourceUri,
+  getPythonApi,
+  activeEnvironmentOverride
+) {
   const candidates = [];
+  const details = [];
+  const accessorConfig = vscode.workspace.getConfiguration("accessor", workspaceFolder.uri);
   addPythonCandidate(
     candidates,
     accessorConfig.get("pythonPath", ""),
     workspaceFolder,
-    false
+    "accessor.pythonPath",
+    details
   );
-
-  const pythonConfig = vscode.workspace.getConfiguration("python", workspaceFolder.uri);
-  addPythonCandidate(
-    candidates,
-    pythonConfig.get("defaultInterpreterPath", ""),
-    workspaceFolder,
-    true
-  );
-  addPythonCandidate(candidates, pythonConfig.get("pythonPath", ""), workspaceFolder, true);
-
-  if (process.platform === "win32") {
-    addUnique(candidates, "py");
-    addUnique(candidates, "python");
-  } else {
-    addUnique(candidates, "python3");
-    addUnique(candidates, "/usr/bin/python3");
-    addUnique(candidates, "python");
+  if (candidates.length > 0) {
+    details.push("Using accessor.pythonPath as an explicit override.");
+    return { candidates, details };
   }
 
-  return candidates;
+  const pythonApi = await getPythonApi();
+  const selectedInterpreter = await getSelectedPythonInterpreterPath(
+    workspaceFolder,
+    resourceUri,
+    pythonApi,
+    activeEnvironmentOverride
+  );
+  details.push(...selectedInterpreter.details);
+  if (selectedInterpreter.path) {
+    addPythonCandidate(
+      candidates,
+      selectedInterpreter.path,
+      workspaceFolder,
+      "selected interpreter",
+      details
+    );
+    return { candidates, details };
+  }
+
+  if (pythonApi) {
+    details.push("No active Python environment path is currently available.");
+    return { candidates, details };
+  }
+
+  details.push("Python API is unavailable and accessor.pythonPath is not set.");
+  return { candidates, details };
 }
 
-function addPythonCandidate(candidates, rawValue, workspaceFolder, allowPlaceholder) {
+async function getSelectedPythonInterpreterPath(
+  workspaceFolder,
+  resourceUri,
+  pythonApi,
+  activeEnvironmentOverride
+) {
+  const details = [];
+  if (activeEnvironmentOverride?.path) {
+    details.push(
+      `${activeEnvironmentOverride.source} -> final=${formatInterpreterValue(
+        activeEnvironmentOverride.path
+      )}`
+    );
+    return { path: activeEnvironmentOverride.path, details };
+  }
+  let selectedEnvironmentPath = "";
+  try {
+    const environments = pythonApi?.environments;
+    if (
+      !environments ||
+      typeof environments.getActiveEnvironmentPath !== "function" ||
+      typeof environments.resolveEnvironment !== "function"
+    ) {
+      details.push("Python environments API is unavailable.");
+    } else {
+      const environmentPathEntries = [
+        {
+          label: "environments.getActiveEnvironmentPath(workspaceFolder)",
+          value: environments.getActiveEnvironmentPath(workspaceFolder)
+        },
+        {
+          label: "environments.getActiveEnvironmentPath(resourceUri)",
+          value: environments.getActiveEnvironmentPath(resourceUri)
+        },
+        {
+          label: "environments.getActiveEnvironmentPath()",
+          value: environments.getActiveEnvironmentPath()
+        }
+      ].filter((entry) => Boolean(entry.value));
+
+      for (const entry of environmentPathEntries) {
+        const resolved = await environments.resolveEnvironment(entry.value);
+        const interpreterPath = extractInterpreterPath(entry.value, resolved);
+        details.push(
+          `${entry.label} -> raw=${formatInterpreterValue(entry.value)} resolved=${formatInterpreterValue(resolved?.path)} executable=${formatInterpreterValue(
+            resolved?.executable?.uri?.fsPath || resolved?.executable?.filename
+          )} final=${formatInterpreterValue(interpreterPath)}`
+        );
+        if (!selectedEnvironmentPath && interpreterPath) {
+          selectedEnvironmentPath = interpreterPath;
+        }
+      }
+      if (environmentPathEntries.length === 0) {
+        details.push("Python environments API returned no active environment paths.");
+      }
+    }
+  } catch (error) {
+    details.push(
+      `Python environments API lookup failed: ${String(error.message || error)}`
+    );
+  }
+  if (selectedEnvironmentPath) {
+    details.push("Interpreter selection -> using environments API result.");
+    return { path: selectedEnvironmentPath, details };
+  }
+  return { path: "", details };
+}
+
+function extractInterpreterPath(environmentPath, resolved) {
+  const resolvedPath = String(
+    resolved?.path || environmentPath?.path || environmentPath || ""
+  ).trim();
+  return (
+    resolved?.executable?.uri?.fsPath ||
+    resolved?.executable?.filename ||
+    resolveEnvironmentExecutablePath(resolvedPath) ||
+    resolvedPath ||
+    ""
+  );
+}
+
+function extractInterpreterPathFromEnvironmentRecord(environment) {
+  return extractInterpreterPath(environment, environment);
+}
+
+function resolveEnvironmentExecutablePath(rawPath) {
+  const resolved = String(rawPath || "").trim();
+  if (!resolved) {
+    return "";
+  }
+  if (!fs.existsSync(resolved)) {
+    return "";
+  }
+
+  let stats;
+  try {
+    stats = fs.statSync(resolved);
+  } catch {
+    return "";
+  }
+
+  if (!stats.isDirectory()) {
+    return resolved;
+  }
+
+  const executable = process.platform === "win32"
+    ? path.join(resolved, "Scripts", "python.exe")
+    : path.join(resolved, "bin", "python");
+  return fs.existsSync(executable) ? executable : "";
+}
+
+function addPythonCandidate(candidates, rawValue, workspaceFolder, source, details = null) {
   const resolved = resolveWorkspaceVariables(String(rawValue || "").trim(), workspaceFolder);
   if (!resolved) {
+    if (details) {
+      details.push(`${source} -> skipped because it resolved to an empty value.`);
+    }
     return;
   }
 
   if (resolved.includes("${command:")) {
+    if (details) {
+      details.push(`${source} -> skipped unresolved command variable: ${resolved}`);
+    }
     return;
   }
 
-  if (!allowPlaceholder && resolved === "python") {
+  if (resolved === "python") {
+    if (details) {
+      details.push(`${source} -> skipped generic placeholder: python`);
+    }
     return;
   }
 
-  if (allowPlaceholder && resolved === "python") {
-    return;
-  }
-
+  const beforeLength = candidates.length;
   addUnique(candidates, resolved);
+  if (!details) {
+    return;
+  }
+  if (candidates.length > beforeLength) {
+    details.push(`${source} -> candidate ${resolved}`);
+  } else {
+    details.push(`${source} -> duplicate candidate ${resolved}`);
+  }
+}
+
+function formatInterpreterValue(value) {
+  if (value === null || value === undefined || value === "") {
+    return "(empty)";
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value?.path === "string" && value.path) {
+    return value.path;
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function getResourceScopeKey(resource) {
+  if (!resource) {
+    return "";
+  }
+  if (typeof resource.fsPath === "string") {
+    return resource.toString();
+  }
+  if (resource.uri && typeof resource.uri.toString === "function") {
+    return resource.uri.toString();
+  }
+  if (typeof resource.path === "string" && resource.path) {
+    return resource.path;
+  }
+  return "";
+}
+
+function resourceMatchesDocument(resource, document) {
+  if (!resource) {
+    return true;
+  }
+  if (resource.uri && typeof resource.uri.toString === "function") {
+    const resourceUri = resource.uri;
+    const resourcePath = resourceUri.fsPath || resourceUri.path;
+    if (!resourcePath) {
+      return true;
+    }
+    return document.uri.fsPath === resourcePath || document.uri.fsPath.startsWith(`${resourcePath}${path.sep}`);
+  }
+  if (typeof resource.fsPath === "string") {
+    return document.uri.fsPath === resource.fsPath;
+  }
+  return true;
 }
 
 function addUnique(items, value) {
@@ -784,8 +1429,140 @@ function addUnique(items, value) {
   items.push(value);
 }
 
+async function activatePythonExtensionApi(analysisService) {
+  try {
+    const pythonExtensionModule = await importPythonExtensionModule();
+    if (pythonExtensionModule?.PythonExtension?.api) {
+      return await pythonExtensionModule.PythonExtension.api();
+    }
+
+    const extension = vscode.extensions.getExtension("ms-python.python");
+    if (!extension) {
+      return null;
+    }
+    return extension.isActive ? extension.exports : await extension.activate();
+  } catch (error) {
+    analysisService.output.appendLine(
+      `Unable to activate the Python extension API: ${String(error.message || error)}`
+    );
+    return null;
+  }
+}
+
+async function importPythonExtensionModule() {
+  try {
+    return await import("@vscode/python-extension");
+  } catch {
+    return null;
+  }
+}
+
+function activatePythonExtensionWatcher(analysisService, context) {
+  const registerWatcher = async () => {
+    const api = await analysisService.getPythonApi();
+    const handleActiveEnvironmentChange = (source, event) => {
+      const changedPath = event?.path || event;
+      const changedResource = event?.resource;
+      analysisService.recordActiveEnvironmentChange(changedResource, changedPath);
+      analysisService.invalidateAll();
+      analysisService.resetWorker();
+      analysisService.refreshOpenPythonEditors(changedResource);
+    };
+
+    if (api) {
+      await api.ready;
+      const environments = api?.environments;
+      if (typeof environments?.onDidChangeActiveEnvironmentPath === "function") {
+        context.subscriptions.push(
+          environments.onDidChangeActiveEnvironmentPath((event) => {
+            handleActiveEnvironmentChange("onDidChangeActiveEnvironmentPath", event);
+          })
+        );
+      }
+      if (typeof environments?.onDidChangeActiveEnvironment === "function") {
+        context.subscriptions.push(
+          environments.onDidChangeActiveEnvironment((event) => {
+            handleActiveEnvironmentChange("onDidChangeActiveEnvironment", event);
+          })
+        );
+      }
+      if (typeof environments?.onDidChangeEnvironments === "function") {
+        context.subscriptions.push(
+          environments.onDidChangeEnvironments((event) => {
+            const eventResource =
+              event?.env?.environment?.workspaceFolder ||
+              vscode.window.activeTextEditor?.document.uri;
+            const updatedInterpreterPath = extractInterpreterPathFromEnvironmentRecord(
+              event?.env
+            );
+            if (updatedInterpreterPath) {
+              analysisService.output.appendLine(
+                `Python interpreter updated from environment discovery: ${updatedInterpreterPath}`
+              );
+              analysisService.recordActiveEnvironmentChange(
+                eventResource,
+                updatedInterpreterPath
+              );
+              analysisService.invalidateAll();
+              analysisService.resetWorker();
+              analysisService.refreshOpenPythonEditors(eventResource);
+              return;
+            }
+            analysisService.scheduleInterpreterRefresh(
+              eventResource,
+              `onDidChangeEnvironments:${formatInterpreterValue(event?.type)}`
+            );
+          })
+        );
+      }
+    }
+  };
+
+  registerWatcher().catch(() => {});
+}
+
 function resolveWorkspaceVariables(value, workspaceFolder) {
   return value.replaceAll("${workspaceFolder}", workspaceFolder.uri.fsPath);
+}
+
+function mergeReports(localReport, discoveryReport, scopeReport) {
+  return {
+    ...discoveryReport,
+    source_module_name: localReport.source_module_name,
+    module_locations: {
+      ...(discoveryReport.module_locations || {}),
+      ...(localReport.module_locations || {})
+    },
+    accessors: [...(discoveryReport.accessors || []), ...(localReport.accessors || [])].sort(
+      compareAccessors
+    ),
+    symbol_types: scopeReport.symbol_types || {},
+    scope_aliases: scopeReport.scope_aliases || {},
+    notes: uniqueStrings([
+      ...(localReport.notes || []),
+      ...(discoveryReport.notes || []),
+      ...(scopeReport.notes || [])
+    ])
+  };
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values)];
+}
+
+function compareAccessors(left, right) {
+  return (
+    left.host_type.localeCompare(right.host_type) ||
+    left.accessor_name.localeCompare(right.accessor_name) ||
+    left.module_name.localeCompare(right.module_name)
+  );
+}
+
+function buildImportsCacheKey(uriKey, pythonKey, localReport) {
+  return `${uriKey}::${pythonKey}::${JSON.stringify({
+    current_package: localReport.current_package || "",
+    imports: localReport.imports || []
+  })}`;
 }
 
 async function runHelper(commands, args, stdinContent) {

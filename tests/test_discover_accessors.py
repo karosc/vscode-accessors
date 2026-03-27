@@ -9,7 +9,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from python.accessor_discovery import discover_accessors
+from python.accessor_discovery import (
+    analyze_source_file,
+    discover_accessors,
+    discover_imported_accessors,
+    discover_scope_context,
+)
 
 
 FIXTURES = PROJECT_ROOT / "tests" / "fixtures"
@@ -171,6 +176,53 @@ class AccessorDiscoveryTests(unittest.TestCase):
         self.assertIn(("xarray.Dataset", "cf"), names)
         self.assertEqual(report["symbol_types"]["da"], "xarray.Dataset")
         self.assertTrue(any("Sanitized line 5" in note for note in report["notes"]))
+
+    def test_scope_only_report_infers_symbols_without_import_walk(self) -> None:
+        report = discover_scope_context(
+            workspace_root=WORKSPACE,
+            source_file=WORKSPACE / "function_scope.py",
+            source_override=(
+                "import xarray as xr\n"
+                "import cf_xarray\n\n"
+                "def render(da: xr.Dataset):\n"
+                "    local = xr.Dataset()\n"
+                "    return da, local\n"
+            ),
+            cursor_line=5,
+        )
+
+        self.assertEqual(report["symbol_types"]["da"], "xarray.Dataset")
+        self.assertEqual(report["symbol_types"]["local"], "xarray.Dataset")
+        self.assertNotIn("accessors", report)
+
+    def test_analyze_source_file_reports_local_imports_and_accessors(self) -> None:
+        report = analyze_source_file(
+            workspace_root=WORKSPACE,
+            source_file=WORKSPACE / "use_cf.py",
+            source_override=(
+                "import xarray as xr\n"
+                "import cf_xarray\n\n"
+                "@xr.register_dataset_accessor('demo')\n"
+                "class DemoAccessor:\n"
+                "    pass\n"
+            ),
+        )
+
+        self.assertIn("cf_xarray", report["imports"])
+        self.assertIn(("xarray.Dataset", "demo"), {(item["host_type"], item["accessor_name"]) for item in report["accessors"]})
+
+    def test_discover_imported_accessors_skips_root_accessors(self) -> None:
+        report = discover_imported_accessors(
+            workspace_root=WORKSPACE,
+            source_file=WORKSPACE / "use_cf.py",
+            import_requests=["xarray", "cf_xarray"],
+            current_package="",
+            extra_search_roots=[SITEPKGS],
+        )
+
+        names = {(item["host_type"], item["accessor_name"]) for item in report["accessors"]}
+        self.assertIn(("xarray.Dataset", "cf"), names)
+        self.assertNotIn(("xarray.Dataset", "demo"), names)
 
 
 if __name__ == "__main__":

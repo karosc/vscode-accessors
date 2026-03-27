@@ -73,6 +73,143 @@ def discover_accessors(
     return context.run()
 
 
+def discover_scope_context(
+    workspace_root: Path,
+    source_file: Path,
+    source_override: str | None = None,
+    cursor_line: int | None = None,
+) -> dict:
+    resolved_workspace = workspace_root.resolve()
+    resolved_source = source_file.resolve()
+    if not resolved_source.is_file():
+        raise FileNotFoundError(f"Source file does not exist: {resolved_source}")
+
+    try:
+        resolved_source.relative_to(resolved_workspace)
+    except ValueError as error:
+        raise ValueError("Source file must be inside the workspace root") from error
+
+    root_module_name = infer_module_name(resolved_workspace, resolved_source)
+    notes: list[str] = []
+    source = source_override if source_override is not None else resolved_source.read_text(encoding="utf-8")
+    parsed = parse_python_source(
+        source=source,
+        filename=resolved_source,
+        module_name=root_module_name,
+        is_package=resolved_source.name == "__init__.py",
+        notes=notes,
+    )
+    current_package = (
+        root_module_name
+        if resolved_source.name == "__init__.py"
+        else root_module_name.rpartition(".")[0]
+    )
+    scope_context = infer_symbol_types(
+        parsed.tree,
+        parsed.aliases,
+        cursor_line,
+        current_package,
+    )
+    notes.sort()
+    return {
+        "workspace_root": str(resolved_workspace),
+        "source_file": str(resolved_source),
+        "source_module_name": root_module_name,
+        "symbol_types": scope_context.symbol_types,
+        "scope_aliases": scope_context.aliases,
+        "notes": notes,
+    }
+
+
+def analyze_source_file(
+    workspace_root: Path,
+    source_file: Path,
+    source_override: str | None = None,
+) -> dict:
+    resolved_workspace = workspace_root.resolve()
+    resolved_source = source_file.resolve()
+    if not resolved_source.is_file():
+        raise FileNotFoundError(f"Source file does not exist: {resolved_source}")
+
+    try:
+        resolved_source.relative_to(resolved_workspace)
+    except ValueError as error:
+        raise ValueError("Source file must be inside the workspace root") from error
+
+    root_module_name = infer_module_name(resolved_workspace, resolved_source)
+    notes: list[str] = []
+    source = source_override if source_override is not None else resolved_source.read_text(encoding="utf-8")
+    is_package = resolved_source.name == "__init__.py"
+    parsed = parse_python_source(
+        source=source,
+        filename=resolved_source,
+        module_name=root_module_name,
+        is_package=is_package,
+        notes=notes,
+    )
+    accessors = collect_accessors_from_parsed_module(
+        path=resolved_source,
+        module_name=root_module_name,
+        parsed=parsed,
+        activation_chain=[str(resolved_source)],
+    )
+    current_package = root_module_name if is_package else root_module_name.rpartition(".")[0]
+    accessors.sort(key=lambda item: (item["host_type"], item["accessor_name"], item["module_name"]))
+    notes.sort()
+    return {
+        "workspace_root": str(resolved_workspace),
+        "source_file": str(resolved_source),
+        "source_module_name": root_module_name,
+        "current_package": current_package,
+        "imports": parsed.imports,
+        "accessors": accessors,
+        "notes": notes,
+        "module_locations": {
+            root_module_name: {
+                "file_path": str(resolved_source),
+                "is_package": is_package,
+            }
+        },
+    }
+
+
+def discover_imported_accessors(
+    workspace_root: Path,
+    source_file: Path,
+    import_requests: Iterable[str],
+    current_package: str,
+    extra_search_roots: Iterable[Path] = (),
+) -> dict:
+    context = DiscoveryContext(
+        workspace_root=workspace_root.resolve(),
+        source_file=source_file.resolve(),
+        extra_search_roots=[Path(root).resolve() for root in extra_search_roots],
+        source_override=None,
+        cursor_line=None,
+    )
+    if not context.source_file.is_file():
+        raise FileNotFoundError(f"Source file does not exist: {context.source_file}")
+    if not context._is_within_workspace(context.source_file):
+        raise ValueError("Source file must be inside the workspace root")
+
+    root_module_name = infer_module_name(context.workspace_root, context.source_file)
+    context._visit_import_requests(list(import_requests), str(context.source_file), current_package)
+    context.accessors.sort(key=lambda item: (item["host_type"], item["accessor_name"], item["module_name"]))
+    context.unresolved_imports.sort(key=lambda item: (item["importer"], item["module_name"]))
+    context.notes.sort()
+    return {
+        "workspace_root": str(context.workspace_root),
+        "source_file": str(context.source_file),
+        "source_module_name": root_module_name,
+        "search_roots": [str(path) for path in context.search_roots],
+        "module_locations": context._serialize_module_locations(root_module_name),
+        "accessors": context.accessors,
+        "visited_modules": context.visited_modules,
+        "unresolved_imports": context.unresolved_imports,
+        "notes": context.notes,
+    }
+
+
 class DiscoveryContext:
     def __init__(
         self,
@@ -308,21 +445,14 @@ class DiscoveryContext:
         parsed: ParsedModule,
         activation_anchor: str,
     ) -> None:
-        for statement in parsed.tree.body:
-            if not isinstance(statement, ast.ClassDef):
-                continue
-            for decorator in statement.decorator_list:
-                record = parse_accessor_decorator(
-                    decorator=decorator,
-                    aliases=parsed.aliases,
-                    module_name=module_name,
-                    class_name=statement.name,
-                    file_path=path,
-                    class_node=statement,
-                    activation_chain=self._activation_chain_for(activation_anchor),
-                )
-                if record is not None:
-                    self.accessors.append(record)
+        self.accessors.extend(
+            collect_accessors_from_parsed_module(
+                path=path,
+                module_name=module_name,
+                parsed=parsed,
+                activation_chain=self._activation_chain_for(activation_anchor),
+            )
+        )
 
     def _activation_chain_for(self, anchor: str) -> list[str]:
         chain = [anchor]
@@ -726,6 +856,31 @@ def resolve_known_value_type(
     return None
 
 
+def collect_accessors_from_parsed_module(
+    path: Path,
+    module_name: str,
+    parsed: ParsedModule,
+    activation_chain: list[str],
+) -> list[dict]:
+    accessors: list[dict] = []
+    for statement in parsed.tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        for decorator in statement.decorator_list:
+            record = parse_accessor_decorator(
+                decorator=decorator,
+                aliases=parsed.aliases,
+                module_name=module_name,
+                class_name=statement.name,
+                file_path=path,
+                class_node=statement,
+                activation_chain=activation_chain,
+            )
+            if record is not None:
+                accessors.append(record)
+    return accessors
+
+
 def parse_accessor_decorator(
     decorator: ast.expr,
     aliases: dict[str, str],
@@ -909,17 +1064,26 @@ def main() -> int:
     parser.add_argument("--search-root", action="append", default=[], type=Path)
     parser.add_argument("--source-stdin", action="store_true")
     parser.add_argument("--line", type=int, default=None)
+    parser.add_argument("--scope-only", action="store_true")
     parser.add_argument("--json-indent", type=int, default=None)
     args = parser.parse_args()
 
     source_override = sys.stdin.read() if args.source_stdin else None
-    report = discover_accessors(
-        workspace_root=args.workspace,
-        source_file=args.file,
-        extra_search_roots=args.search_root,
-        source_override=source_override,
-        cursor_line=args.line,
-    )
+    if args.scope_only:
+        report = discover_scope_context(
+            workspace_root=args.workspace,
+            source_file=args.file,
+            source_override=source_override,
+            cursor_line=args.line,
+        )
+    else:
+        report = discover_accessors(
+            workspace_root=args.workspace,
+            source_file=args.file,
+            extra_search_roots=args.search_root,
+            source_override=source_override,
+            cursor_line=args.line,
+        )
     print(json.dumps(report, indent=args.json_indent))
     return 0
 

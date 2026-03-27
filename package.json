@@ -2,8 +2,8 @@
   "name": "accessor-discovery-prototype",
   "displayName": "Accessor Discovery",
   "description": "Completion, hover, and definition support for xarray and pandas accessors in Python.",
-  "version": "0.0.1",
-  "publisher": "local",
+  "version": "0.1.0",
+  "publisher": "karosc",
   "preview": true,
   "markdown": "github",
   "repository": {
@@ -38,7 +38,13 @@
     "onCommand:accessor.analyzeCurrentFile",
     "onLanguage:python"
   ],
-  "main": "./extension/extension.js",
+  "extensionDependencies": [
+    "ms-python.python"
+  ],
+  "main": "./extension.js",
+  "dependencies": {
+    "@vscode/python-extension": "^1.0.6"
+  },
   "contributes": {
     "commands": [
       {
@@ -52,7 +58,7 @@
         "accessor.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Optional Python interpreter path used to run the accessor discovery helper. If empty, the extension falls back to Python extension settings and then `python3`."
+          "description": "Optional Python interpreter path used to run the accessor discovery helper. If set, it overrides the Python extension active environment. If empty, the extension uses the active Python environment from the Python extension."
         }
       }
     }
