@@ -1,0 +1,41 @@
+{
+  "name": "accessor-discovery-prototype",
+  "displayName": "Accessor Discovery Prototype",
+  "description": "Prototype VS Code extension for statically discovering xarray and pandas accessors through recursive import analysis.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:accessor.analyzeCurrentFile",
+    "onLanguage:python"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "accessor.analyzeCurrentFile",
+        "title": "Accessor: Analyze Current Python File"
+      }
+    ],
+    "configuration": {
+      "title": "Accessor Discovery",
+      "properties": {
+        "accessor.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Python interpreter path used to run the accessor discovery helper. If empty, the extension falls back to Python extension settings and then `python3`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "npm run test:resolver && npm run test:overlay",
+    "test:resolver": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "test:overlay": "node --test tests/*.test.js"
+  }
+}
