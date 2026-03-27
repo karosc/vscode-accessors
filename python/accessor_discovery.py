@@ -7,7 +7,7 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 
 KNOWN_REGISTRARS = {
@@ -147,11 +147,19 @@ def analyze_source_file(
         is_package=is_package,
         notes=notes,
     )
+    resolver_context = DiscoveryContext(
+        workspace_root=resolved_workspace,
+        source_file=resolved_source,
+        extra_search_roots=[],
+        source_override=source_override,
+        cursor_line=None,
+    )
     accessors = collect_accessors_from_parsed_module(
         path=resolved_source,
         module_name=root_module_name,
         parsed=parsed,
         activation_chain=[str(resolved_source)],
+        class_resolver=resolver_context.resolve_annotation_class_info,
     )
     current_package = root_module_name if is_package else root_module_name.rpartition(".")[0]
     accessors.sort(key=lambda item: (item["host_type"], item["accessor_name"], item["module_name"]))
@@ -451,6 +459,7 @@ class DiscoveryContext:
                 module_name=module_name,
                 parsed=parsed,
                 activation_chain=self._activation_chain_for(activation_anchor),
+                class_resolver=self.resolve_annotation_class_info,
             )
         )
 
@@ -475,6 +484,48 @@ class DiscoveryContext:
                 return resolution
         self.module_cache[module_name] = None
         return None
+
+    def resolve_annotation_class_info(
+        self,
+        annotation: ast.AST,
+        aliases: dict[str, str],
+    ) -> tuple[str, list[dict]] | None:
+        return self._resolve_annotation_class_info(annotation, aliases, set())
+
+    def _resolve_annotation_class_info(
+        self,
+        annotation: ast.AST,
+        aliases: dict[str, str],
+        visited: set[str],
+    ) -> tuple[str, list[dict]] | None:
+        qualified_name = render_annotation_reference(annotation, aliases)
+        if qualified_name is None or qualified_name in visited:
+            return None
+        visited.add(qualified_name)
+
+        module_name, _, class_name = qualified_name.rpartition(".")
+        if not module_name or not class_name:
+            return None
+
+        location = self._resolve_module(module_name)
+        if location is None or location.file_path is None:
+            return None
+
+        parsed = self._parse_module(
+            path=location.file_path,
+            module_name=module_name,
+            is_package=location.is_package,
+            use_source_override=False,
+        )
+        for statement in parsed.tree.body:
+            if isinstance(statement, ast.ClassDef) and statement.name == class_name:
+                return statement.name, extract_class_members(statement, location.file_path)
+
+        redirected = parsed.aliases.get(class_name)
+        if redirected is None:
+            return None
+        redirected_node = ast.Name(id=redirected)
+        return self._resolve_annotation_class_info(redirected_node, {}, visited)
 
     def _is_within_workspace(self, path: Path) -> bool:
         try:
@@ -861,20 +912,53 @@ def collect_accessors_from_parsed_module(
     module_name: str,
     parsed: ParsedModule,
     activation_chain: list[str],
+    class_resolver: Callable[[ast.AST, dict[str, str]], tuple[str, list[dict]] | None]
+    | None = None,
 ) -> list[dict]:
+    class_nodes = {
+        statement.name: statement
+        for statement in parsed.tree.body
+        if isinstance(statement, ast.ClassDef)
+    }
+    function_nodes = {
+        statement.name: statement
+        for statement in parsed.tree.body
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    module_string_values = collect_module_string_values(parsed.tree.body)
+    class_attribute_string_values = collect_class_attribute_string_values(class_nodes)
     accessors: list[dict] = []
     for statement in parsed.tree.body:
-        if not isinstance(statement, ast.ClassDef):
+        if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in statement.decorator_list:
+                record = parse_accessor_decorator(
+                    decorator=decorator,
+                    aliases=parsed.aliases,
+                    module_name=module_name,
+                    file_path=path,
+                    target_node=statement,
+                    class_nodes=class_nodes,
+                    module_string_values=module_string_values,
+                    class_attribute_string_values=class_attribute_string_values,
+                    activation_chain=activation_chain,
+                    class_resolver=class_resolver,
+                )
+                if record is not None:
+                    accessors.append(record)
             continue
-        for decorator in statement.decorator_list:
-            record = parse_accessor_decorator(
-                decorator=decorator,
+
+        if isinstance(statement, ast.Expr):
+            record = parse_accessor_registration_call(
+                expression=statement.value,
                 aliases=parsed.aliases,
                 module_name=module_name,
-                class_name=statement.name,
                 file_path=path,
-                class_node=statement,
+                class_nodes=class_nodes,
+                function_nodes=function_nodes,
+                module_string_values=module_string_values,
+                class_attribute_string_values=class_attribute_string_values,
                 activation_chain=activation_chain,
+                class_resolver=class_resolver,
             )
             if record is not None:
                 accessors.append(record)
@@ -885,10 +969,14 @@ def parse_accessor_decorator(
     decorator: ast.expr,
     aliases: dict[str, str],
     module_name: str,
-    class_name: str,
     file_path: Path,
-    class_node: ast.ClassDef,
+    target_node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    class_nodes: dict[str, ast.ClassDef],
+    module_string_values: dict[str, str],
+    class_attribute_string_values: dict[tuple[str, str], str],
     activation_chain: list[str],
+    class_resolver: Callable[[ast.AST, dict[str, str]], tuple[str, list[dict]] | None]
+    | None = None,
 ) -> dict | None:
     if not isinstance(decorator, ast.Call):
         return None
@@ -898,22 +986,201 @@ def parse_accessor_decorator(
         return None
     if not decorator.args:
         return None
-    accessor_name = extract_string_literal(decorator.args[0])
+    accessor_name = resolve_string_literal(
+        decorator.args[0],
+        module_string_values,
+        class_attribute_string_values,
+    )
     if accessor_name is None:
         return None
+    return build_accessor_record(
+        host_type=host_type,
+        accessor_name=accessor_name,
+        decorator_name=resolved_name,
+        module_name=module_name,
+        file_path=file_path,
+        target_node=target_node,
+        class_nodes=class_nodes,
+        aliases=aliases,
+        activation_chain=activation_chain,
+        class_resolver=class_resolver,
+    )
+
+
+def parse_accessor_registration_call(
+    expression: ast.expr,
+    aliases: dict[str, str],
+    module_name: str,
+    file_path: Path,
+    class_nodes: dict[str, ast.ClassDef],
+    function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+    module_string_values: dict[str, str],
+    class_attribute_string_values: dict[tuple[str, str], str],
+    activation_chain: list[str],
+    class_resolver: Callable[[ast.AST, dict[str, str]], tuple[str, list[dict]] | None]
+    | None = None,
+) -> dict | None:
+    if not isinstance(expression, ast.Call):
+        return None
+    if not isinstance(expression.func, ast.Call):
+        return None
+
+    decorator_call = expression.func
+    resolved_name = render_dotted_name(decorator_call.func, aliases)
+    host_type = KNOWN_REGISTRARS.get(resolved_name)
+    if host_type is None or not decorator_call.args or not expression.args:
+        return None
+
+    accessor_name = resolve_string_literal(
+        decorator_call.args[0],
+        module_string_values,
+        class_attribute_string_values,
+    )
+    if accessor_name is None:
+        return None
+
+    target_node = resolve_accessor_target_node(expression.args[0], class_nodes, function_nodes)
+    if target_node is None:
+        return None
+
+    return build_accessor_record(
+        host_type=host_type,
+        accessor_name=accessor_name,
+        decorator_name=resolved_name,
+        module_name=module_name,
+        file_path=file_path,
+        target_node=target_node,
+        class_nodes=class_nodes,
+        aliases=aliases,
+        activation_chain=activation_chain,
+        class_resolver=class_resolver,
+    )
+
+
+def build_accessor_record(
+    host_type: str,
+    accessor_name: str,
+    decorator_name: str,
+    module_name: str,
+    file_path: Path,
+    target_node: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+    class_nodes: dict[str, ast.ClassDef],
+    aliases: dict[str, str],
+    activation_chain: list[str],
+    class_resolver: Callable[[ast.AST, dict[str, str]], tuple[str, list[dict]] | None]
+    | None = None,
+) -> dict:
+    accessor_class = target_node.name
+    members: list[dict] = []
+
+    if isinstance(target_node, ast.ClassDef):
+        accessor_class = target_node.name
+        members = extract_class_members(target_node, file_path)
+    else:
+        resolved_return_class = resolve_return_class_node(target_node, class_nodes)
+        if resolved_return_class is not None:
+            accessor_class = resolved_return_class.name
+            members = extract_class_members(resolved_return_class, file_path)
+        elif class_resolver is not None and target_node.returns is not None:
+            resolved_class_info = class_resolver(target_node.returns, aliases)
+            if resolved_class_info is not None:
+                accessor_class, members = resolved_class_info
+        elif target_node.returns is not None:
+            accessor_class = safe_unparse(target_node.returns)
+
     return {
         "host_type": host_type,
         "accessor_name": accessor_name,
-        "accessor_class": class_name,
+        "accessor_class": accessor_class,
         "module_name": module_name,
         "file_path": str(file_path),
-        "decorator": resolved_name,
+        "decorator": decorator_name,
         "activation_chain": activation_chain,
-        "line": class_node.lineno,
-        "end_line": getattr(class_node, "end_lineno", class_node.lineno),
-        "docstring": ast.get_docstring(class_node) or "",
-        "members": extract_class_members(class_node, file_path),
+        "line": target_node.lineno,
+        "end_line": getattr(target_node, "end_lineno", target_node.lineno),
+        "docstring": ast.get_docstring(target_node) or "",
+        "members": members,
     }
+
+
+def resolve_accessor_target_node(
+    node: ast.AST,
+    class_nodes: dict[str, ast.ClassDef],
+    function_nodes: dict[str, ast.FunctionDef | ast.AsyncFunctionDef],
+) -> ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef | None:
+    if not isinstance(node, ast.Name):
+        return None
+    if node.id in class_nodes:
+        return class_nodes[node.id]
+    return function_nodes.get(node.id)
+
+
+def resolve_return_class_node(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    class_nodes: dict[str, ast.ClassDef],
+) -> ast.ClassDef | None:
+    if function_node.returns is None:
+        return None
+    rendered = render_dotted_name(function_node.returns, {})
+    if rendered is None:
+        return None
+    return class_nodes.get(rendered)
+
+
+def collect_module_string_values(statements: list[ast.stmt]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for statement in statements:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            if isinstance(target, ast.Name):
+                literal = extract_string_literal(statement.value)
+                if literal is not None:
+                    values[target.id] = literal
+            continue
+
+        if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            literal = extract_string_literal(statement.value)
+            if literal is not None:
+                values[statement.target.id] = literal
+    return values
+
+
+def collect_class_attribute_string_values(
+    class_nodes: dict[str, ast.ClassDef],
+) -> dict[tuple[str, str], str]:
+    values: dict[tuple[str, str], str] = {}
+    for class_name, class_node in class_nodes.items():
+        for statement in class_node.body:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target = statement.targets[0]
+                if isinstance(target, ast.Name):
+                    literal = extract_string_literal(statement.value)
+                    if literal is not None:
+                        values[(class_name, target.id)] = literal
+                continue
+
+            if isinstance(statement, ast.AnnAssign) and isinstance(
+                statement.target, ast.Name
+            ):
+                literal = extract_string_literal(statement.value)
+                if literal is not None:
+                    values[(class_name, statement.target.id)] = literal
+    return values
+
+
+def resolve_string_literal(
+    node: ast.AST,
+    module_string_values: dict[str, str],
+    class_attribute_string_values: dict[tuple[str, str], str],
+) -> str | None:
+    literal = extract_string_literal(node)
+    if literal is not None:
+        return literal
+    if isinstance(node, ast.Name):
+        return module_string_values.get(node.id)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return class_attribute_string_values.get((node.value.id, node.attr))
+    return None
 
 
 def extract_class_members(class_node: ast.ClassDef, file_path: Path) -> list[dict]:
@@ -1042,6 +1309,21 @@ def render_dotted_name(node: ast.AST, aliases: dict[str, str]) -> str | None:
             return None
         return f"{base}.{node.attr}"
     return None
+
+
+def render_annotation_reference(node: ast.AST, aliases: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Subscript):
+        return render_annotation_reference(node.slice, aliases) or render_annotation_reference(
+            node.value, aliases
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return render_annotation_reference(node.left, aliases) or render_annotation_reference(
+            node.right, aliases
+        )
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        cleaned = node.value.strip().strip("\"'")
+        return aliases.get(cleaned, cleaned)
+    return render_dotted_name(node, aliases)
 
 
 def extract_string_literal(node: ast.AST) -> str | None:

@@ -211,6 +211,75 @@ class AccessorDiscoveryTests(unittest.TestCase):
         self.assertIn("cf_xarray", report["imports"])
         self.assertIn(("xarray.Dataset", "demo"), {(item["host_type"], item["accessor_name"]) for item in report["accessors"]})
 
+    def test_function_accessor_is_discovered(self) -> None:
+        report = analyze_source_file(
+            workspace_root=WORKSPACE,
+            source_file=WORKSPACE / "use_cf.py",
+            source_override=(
+                "import xarray\n\n"
+                "@xarray.register_dataset_accessor('ems')\n"
+                "def ems_accessor(dataset: xarray.Dataset) -> Convention:\n"
+                "    \"\"\"Resolve the convention accessor.\"\"\"\n"
+                "    return Convention(dataset)\n\n"
+                "class Convention:\n"
+                "    def summary(self) -> str:\n"
+                "        return ''\n"
+            ),
+        )
+
+        accessor = next(
+            item for item in report["accessors"] if item["accessor_name"] == "ems"
+        )
+        self.assertEqual(accessor["host_type"], "xarray.Dataset")
+        self.assertEqual(accessor["accessor_class"], "Convention")
+        self.assertEqual(accessor["docstring"], "Resolve the convention accessor.")
+        self.assertIn("summary", {member["name"] for member in accessor["members"]})
+
+    def test_function_accessor_uses_imported_return_class_members(self) -> None:
+        report = analyze_source_file(
+            workspace_root=WORKSPACE,
+            source_file=WORKSPACE / "use_cf.py",
+            source_override=(
+                "import xarray as xr\n"
+                "from conventions import Convention\n\n"
+                "@xr.register_dataset_accessor('ems')\n"
+                "def ems_accessor(dataset: xr.Dataset) -> Convention:\n"
+                "    return Convention(dataset)\n"
+            ),
+        )
+
+        accessor = next(
+            item for item in report["accessors"] if item["accessor_name"] == "ems"
+        )
+        self.assertEqual(accessor["accessor_class"], "Convention")
+        self.assertIn("summary", {member["name"] for member in accessor["members"]})
+        self.assertIn("title", {member["name"] for member in accessor["members"]})
+
+    def test_callable_registration_accessor_is_discovered(self) -> None:
+        report = analyze_source_file(
+            workspace_root=WORKSPACE,
+            source_file=WORKSPACE / "use_cf.py",
+            source_override=(
+                "import dataclasses\n"
+                "import xarray\n\n"
+                "@dataclasses.dataclass\n"
+                "class State:\n"
+                "    accessor_name: str = '_emsarray_state'\n\n"
+                "    def is_bound(self) -> bool:\n"
+                "        return False\n\n"
+                "xarray.register_dataset_accessor(State.accessor_name)(State)\n"
+            ),
+        )
+
+        accessor = next(
+            item
+            for item in report["accessors"]
+            if item["accessor_name"] == "_emsarray_state"
+        )
+        self.assertEqual(accessor["host_type"], "xarray.Dataset")
+        self.assertEqual(accessor["accessor_class"], "State")
+        self.assertIn("is_bound", {member["name"] for member in accessor["members"]})
+
     def test_discover_imported_accessors_skips_root_accessors(self) -> None:
         report = discover_imported_accessors(
             workspace_root=WORKSPACE,
