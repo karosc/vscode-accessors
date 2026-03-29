@@ -39,7 +39,6 @@ function activate(context) {
       analysisService.invalidateForDocument(document)
     ),
     vscode.workspace.onDidChangeTextDocument((event) => {
-      analysisService.invalidateForDocument(event.document);
       const editor = vscode.window.activeTextEditor;
       if (editor && editor.document.uri.toString() === event.document.uri.toString()) {
         schedulePrefetch(event.document, editor.selection.active);
@@ -53,7 +52,6 @@ function activate(context) {
       schedulePrefetch(editor?.document || null, editor?.selection.active || null);
     }),
     vscode.workspace.onDidChangeNotebookDocument((event) => {
-      analysisService.invalidateDocument(event.notebook.uri.toString());
       const editor = vscode.window.activeTextEditor;
       if (editor && isDocumentInNotebook(editor.document, event.notebook)) {
         schedulePrefetch(editor.document, editor.selection.active);
