@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const vscode = require("vscode");
+const { buildCombinedNotebookSource, countLines } = require("./lib/notebook");
 
 const {
   extractCompletionReference,
@@ -21,22 +22,24 @@ const COMPLETION_TRIGGERS = [
   ..."abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 ];
 const COMPLETION_TRIGGER_SET = new Set(COMPLETION_TRIGGERS);
+const PYTHON_LANGUAGE_ID = "python";
 
 function activate(context) {
   const output = vscode.window.createOutputChannel("Accessor Discovery");
   const analysisService = new AnalysisService(context, output);
   context.subscriptions.push(output, { dispose: () => analysisService.dispose() });
   const schedulePrefetch = (document, position) => {
-    if (document && document.languageId === "python") {
+    if (isPythonAnalysisDocument(document)) {
       analysisService.prefetch(document, position);
     }
   };
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(() => analysisService.invalidateAll()),
     vscode.workspace.onDidCloseTextDocument((document) =>
-      analysisService.invalidateDocument(document.uri.toString())
+      analysisService.invalidateForDocument(document)
     ),
     vscode.workspace.onDidChangeTextDocument((event) => {
+      analysisService.invalidateForDocument(event.document);
       const editor = vscode.window.activeTextEditor;
       if (editor && editor.document.uri.toString() === event.document.uri.toString()) {
         schedulePrefetch(event.document, editor.selection.active);
@@ -49,6 +52,19 @@ function activate(context) {
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       schedulePrefetch(editor?.document || null, editor?.selection.active || null);
     }),
+    vscode.workspace.onDidChangeNotebookDocument((event) => {
+      analysisService.invalidateDocument(event.notebook.uri.toString());
+      const editor = vscode.window.activeTextEditor;
+      if (editor && isDocumentInNotebook(editor.document, event.notebook)) {
+        schedulePrefetch(editor.document, editor.selection.active);
+      }
+    }),
+    vscode.workspace.onDidSaveNotebookDocument((notebook) =>
+      analysisService.invalidateDocument(notebook.uri.toString())
+    ),
+    vscode.workspace.onDidCloseNotebookDocument((notebook) =>
+      analysisService.invalidateDocument(notebook.uri.toString())
+    ),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration("accessor") || event.affectsConfiguration("python")) {
         analysisService.invalidateAll();
@@ -62,9 +78,9 @@ function activate(context) {
   context.subscriptions.push(
     vscode.commands.registerCommand("accessor.analyzeCurrentFile", async () => {
       const editor = vscode.window.activeTextEditor;
-      if (!editor || editor.document.languageId !== "python") {
+      if (!editor || !isPythonAnalysisDocument(editor.document)) {
         vscode.window.showErrorMessage(
-          "Open a Python file before running accessor analysis."
+          "Open a Python file or Python notebook cell before running accessor analysis."
         );
         return;
       }
@@ -161,29 +177,33 @@ class AnalysisService {
   }
 
   async getReport(document, position = null) {
-    const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
-    if (!workspaceFolder) {
+    const target = resolveAnalysisTarget(document, position);
+    if (!target?.workspaceFolder) {
       throw new Error("The current file must be inside a workspace folder.");
     }
 
-    const pythonCandidates = await this.getPythonCandidates(workspaceFolder, document.uri);
-    const lineKey = position ? position.line + 1 : 0;
+    return this.getReportForTarget(target);
+  }
+
+  async getReportForTarget(target) {
+    const pythonCandidates = await this.getPythonCandidates(
+      target.workspaceFolder,
+      target.resourceUri
+    );
+    const lineKey = target.position ? target.position.line + 1 : 0;
     const localReport = await this.getLocalReport(
-      workspaceFolder,
-      document,
+      target,
       pythonCandidates
     );
     const discoveryReport = await this.getDiscoveryReport(
-      workspaceFolder,
-      document,
+      target,
       pythonCandidates,
       localReport
     );
     const scopeReport = await this.getScopeReport(
-      workspaceFolder,
-      document,
+      target,
       pythonCandidates,
-      lineKey || document.lineCount
+      lineKey || countTextDocumentLines(target.source)
     );
     return mergeReports(localReport, discoveryReport, scopeReport);
   }
@@ -264,7 +284,7 @@ class AnalysisService {
 
   refreshOpenPythonEditors(resource) {
     for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.languageId !== "python") {
+      if (!isPythonAnalysisDocument(editor.document)) {
         continue;
       }
       if (!resourceMatchesDocument(resource, editor.document)) {
@@ -298,13 +318,13 @@ class AnalysisService {
     this.interpreterRefreshTimers.set(key, timers);
   }
 
-  async getLocalReport(workspaceFolder, document, pythonCandidates) {
-    const cacheKey = document.uri.toString();
+  async getLocalReport(target, pythonCandidates) {
+    const cacheKey = target.cacheKey;
     const pythonKey = pythonCandidates.join("::");
     const cached = this.localCache.get(cacheKey);
     if (
       cached &&
-      cached.version === document.version &&
+      cached.version === target.version &&
       cached.pythonKey === pythonKey
     ) {
       return cached.report;
@@ -324,13 +344,13 @@ class AnalysisService {
     const pending = this.workerClient
       .request(pythonCandidates, args, {
         mode: "local",
-        workspace: workspaceFolder.uri.fsPath,
-        file: document.uri.fsPath,
-        source: document.getText()
+        workspace: target.workspaceFolder.uri.fsPath,
+        file: target.filePath,
+        source: target.source
       })
       .then((report) => {
         this.localCache.set(cacheKey, {
-          version: document.version,
+          version: target.version,
           pythonKey,
           report
         });
@@ -343,9 +363,9 @@ class AnalysisService {
     return pending;
   }
 
-  async getDiscoveryReport(workspaceFolder, document, pythonCandidates, localReport) {
+  async getDiscoveryReport(target, pythonCandidates, localReport) {
     const pythonKey = pythonCandidates.join("::");
-    const cacheKey = buildImportsCacheKey(document.uri.toString(), pythonKey, localReport);
+    const cacheKey = buildImportsCacheKey(target.cacheKey, pythonKey, localReport);
     const cached = this.discoveryCache.get(cacheKey);
     if (cached) {
       return cached.report;
@@ -363,8 +383,8 @@ class AnalysisService {
     const pending = this.workerClient
       .request(pythonCandidates, args, {
         mode: "imports",
-        workspace: workspaceFolder.uri.fsPath,
-        file: document.uri.fsPath,
+        workspace: target.workspaceFolder.uri.fsPath,
+        file: target.filePath,
         imports: localReport.imports || [],
         current_package: localReport.current_package || ""
       })
@@ -379,13 +399,13 @@ class AnalysisService {
     return pending;
   }
 
-  async getScopeReport(workspaceFolder, document, pythonCandidates, lineKey) {
-    const cacheKey = `${document.uri.toString()}::${lineKey}`;
+  async getScopeReport(target, pythonCandidates, lineKey) {
+    const cacheKey = `${target.cacheKey}::${lineKey}`;
     const pythonKey = pythonCandidates.join("::");
     const cached = this.scopeCache.get(cacheKey);
     if (
       cached &&
-      cached.version === document.version &&
+      cached.version === target.version &&
       cached.pythonKey === pythonKey
     ) {
       return cached.report;
@@ -405,14 +425,14 @@ class AnalysisService {
     const pending = this.workerClient
       .request(pythonCandidates, args, {
         mode: "scope",
-        workspace: workspaceFolder.uri.fsPath,
-        file: document.uri.fsPath,
+        workspace: target.workspaceFolder.uri.fsPath,
+        file: target.filePath,
         line: lineKey,
-        source: document.getText()
+        source: target.source
       })
       .then((report) => {
         this.scopeCache.set(cacheKey, {
-          version: document.version,
+          version: target.version,
           pythonKey,
           report
         });
@@ -434,31 +454,18 @@ class AnalysisService {
     this.scopePending.delete(key);
   }
 
+  invalidateForDocument(document) {
+    const key = resolveInvalidationKey(document);
+    this.invalidateDocument(key);
+  }
+
   invalidateDocument(uriKey) {
-    this.localCache.delete(uriKey);
-    this.localPending.delete(uriKey);
-    this.discoveryCache.delete(uriKey);
-    this.discoveryPending.delete(uriKey);
-    for (const key of this.discoveryCache.keys()) {
-      if (key.startsWith(`${uriKey}::`)) {
-        this.discoveryCache.delete(key);
-      }
-    }
-    for (const key of this.discoveryPending.keys()) {
-      if (key.startsWith(`${uriKey}::`)) {
-        this.discoveryPending.delete(key);
-      }
-    }
-    for (const key of this.scopeCache.keys()) {
-      if (key.startsWith(`${uriKey}::`)) {
-        this.scopeCache.delete(key);
-      }
-    }
-    for (const key of this.scopePending.keys()) {
-      if (key.startsWith(`${uriKey}::`)) {
-        this.scopePending.delete(key);
-      }
-    }
+    deleteKeysWithPrefix(this.localCache, uriKey);
+    deleteKeysWithPrefix(this.localPending, uriKey);
+    deleteKeysWithPrefix(this.discoveryCache, uriKey);
+    deleteKeysWithPrefix(this.discoveryPending, uriKey);
+    deleteKeysWithPrefix(this.scopeCache, uriKey);
+    deleteKeysWithPrefix(this.scopePending, uriKey);
     const timer = this.prefetchTimers.get(uriKey);
     if (timer) {
       clearTimeout(timer);
@@ -496,7 +503,12 @@ class AnalysisService {
   }
 
   prefetch(document, position = null) {
-    const uriKey = document.uri.toString();
+    const target = resolveAnalysisTarget(document, position);
+    if (!target) {
+      return;
+    }
+
+    const uriKey = target.invalidationKey;
     const existing = this.prefetchTimers.get(uriKey);
     if (existing) {
       clearTimeout(existing);
@@ -504,13 +516,17 @@ class AnalysisService {
 
     const timer = setTimeout(() => {
       this.prefetchTimers.delete(uriKey);
-      this.getReport(document, position).catch(() => {});
+      this.getReportForTarget(target).catch(() => {});
     }, 75);
     this.prefetchTimers.set(uriKey, timer);
   }
 
   async warm(document, position = null) {
-    return this.getReport(document, position);
+    const target = resolveAnalysisTarget(document, position);
+    if (!target) {
+      throw new Error("The current file must be inside a workspace folder.");
+    }
+    return this.getReportForTarget(target);
   }
 }
 
@@ -1480,6 +1496,131 @@ function formatInterpreterValue(value) {
   }
 }
 
+function isPythonAnalysisDocument(document) {
+  return Boolean(document && document.languageId === PYTHON_LANGUAGE_ID);
+}
+
+function resolveAnalysisTarget(document, position = null) {
+  if (!isPythonAnalysisDocument(document)) {
+    return null;
+  }
+
+  const notebookCell = findNotebookCellContext(document);
+  if (notebookCell) {
+    return resolveNotebookAnalysisTarget(document, position, notebookCell);
+  }
+
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+  if (!workspaceFolder) {
+    return null;
+  }
+
+  return {
+    workspaceFolder,
+    resourceUri: document.uri,
+    filePath: document.uri.fsPath,
+    source: document.getText(),
+    position,
+    cacheKey: document.uri.toString(),
+    invalidationKey: document.uri.toString(),
+    version: document.version
+  };
+}
+
+function resolveNotebookAnalysisTarget(document, position, notebookCell) {
+  const workspaceFolder =
+    vscode.workspace.getWorkspaceFolder(notebookCell.notebook.uri) ||
+    vscode.workspace.getWorkspaceFolder(document.uri);
+  if (!workspaceFolder) {
+    return null;
+  }
+
+  const combinedSource = buildCombinedNotebookSource(
+    notebookCell.notebook.getCells().map((cell) => ({
+      kind: cell.kind === vscode.NotebookCellKind.Code ? "code" : "markup",
+      languageId: cell.document.languageId,
+      text: cell.document.getText()
+    })),
+    notebookCell.cellIndex,
+    PYTHON_LANGUAGE_ID
+  );
+  if (!combinedSource) {
+    return null;
+  }
+
+  return {
+    workspaceFolder,
+    resourceUri: notebookCell.notebook.uri,
+    filePath: resolveNotebookAnalysisFilePath(workspaceFolder, notebookCell.notebook.uri),
+    source: combinedSource.source,
+    position: position
+      ? new vscode.Position(combinedSource.lineOffset + position.line, position.character)
+      : null,
+    cacheKey: `${notebookCell.notebook.uri.toString()}::cell:${notebookCell.cellIndex}`,
+    invalidationKey: notebookCell.notebook.uri.toString(),
+    version: notebookCell.notebook.version
+  };
+}
+
+function findNotebookCellContext(document) {
+  const documentKey = document?.uri?.toString();
+  if (!documentKey) {
+    return null;
+  }
+
+  for (const notebook of vscode.workspace.notebookDocuments) {
+    const cells = notebook.getCells();
+    const cellIndex = cells.findIndex(
+      (candidate) => candidate.document.uri.toString() === documentKey
+    );
+    if (cellIndex !== -1) {
+      return {
+        notebook,
+        cellIndex
+      };
+    }
+  }
+
+  return null;
+}
+
+function isDocumentInNotebook(document, notebook) {
+  const notebookCell = findNotebookCellContext(document);
+  return Boolean(
+    notebookCell &&
+      notebookCell.notebook.uri.toString() === notebook.uri.toString()
+  );
+}
+
+function resolveInvalidationKey(document) {
+  const notebookCell = findNotebookCellContext(document);
+  return notebookCell
+    ? notebookCell.notebook.uri.toString()
+    : document.uri.toString();
+}
+
+function resolveNotebookAnalysisFilePath(workspaceFolder, notebookUri) {
+  if (notebookUri.scheme === "file" && notebookUri.fsPath) {
+    return notebookUri.fsPath;
+  }
+
+  const baseName = sanitizeVirtualModuleName(path.posix.basename(notebookUri.path || ""));
+  return path.join(
+    workspaceFolder.uri.fsPath,
+    "__accessor_virtual__",
+    `${baseName || "notebook"}.py`
+  );
+}
+
+function sanitizeVirtualModuleName(value) {
+  const stem = path.posix.parse(String(value || "")).name || "notebook";
+  return stem.replace(/[^A-Za-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "notebook";
+}
+
+function countTextDocumentLines(text) {
+  return countLines(text);
+}
+
 function getResourceScopeKey(resource) {
   if (!resource) {
     return "";
@@ -1500,16 +1641,25 @@ function resourceMatchesDocument(resource, document) {
   if (!resource) {
     return true;
   }
+  const resourceUris = [document.uri];
+  const notebookCell = findNotebookCellContext(document);
+  if (notebookCell) {
+    resourceUris.push(notebookCell.notebook.uri);
+  }
   if (resource.uri && typeof resource.uri.toString === "function") {
     const resourceUri = resource.uri;
     const resourcePath = resourceUri.fsPath || resourceUri.path;
     if (!resourcePath) {
       return true;
     }
-    return document.uri.fsPath === resourcePath || document.uri.fsPath.startsWith(`${resourcePath}${path.sep}`);
+    return resourceUris.some(
+      (uri) =>
+        uri.fsPath === resourcePath ||
+        uri.fsPath.startsWith(`${resourcePath}${path.sep}`)
+    );
   }
   if (typeof resource.fsPath === "string") {
-    return document.uri.fsPath === resource.fsPath;
+    return resourceUris.some((uri) => uri.fsPath === resource.fsPath);
   }
   return true;
 }
@@ -1519,6 +1669,15 @@ function addUnique(items, value) {
     return;
   }
   items.push(value);
+}
+
+function deleteKeysWithPrefix(map, prefix) {
+  map.delete(prefix);
+  for (const key of [...map.keys()]) {
+    if (key.startsWith(`${prefix}::`)) {
+      map.delete(key);
+    }
+  }
 }
 
 async function activatePythonExtensionApi(analysisService) {
@@ -1798,7 +1957,7 @@ function formatReport(report) {
 }
 
 function maybeTriggerSuggestForChange(analysisService, event, editor) {
-  if (editor.document.languageId !== "python") {
+  if (!isPythonAnalysisDocument(editor.document)) {
     return;
   }
 
