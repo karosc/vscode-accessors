@@ -36,7 +36,9 @@
   },
   "activationEvents": [
     "onCommand:accessor.analyzeCurrentFile",
-    "onLanguage:python"
+    "onLanguage:python",
+    "onNotebook:jupyter-notebook",
+    "onNotebook:interactive"
   ],
   "extensionDependencies": [
     "ms-python.python"

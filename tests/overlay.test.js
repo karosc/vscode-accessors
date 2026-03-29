@@ -14,6 +14,7 @@ const {
   resolveExpressionAlias,
   resolveKnownHostTypeExpression
 } = require("../lib/overlay");
+const { buildCombinedNotebookSource } = require("../lib/notebook");
 
 test("extractCompletionReference handles accessor property completions", () => {
   assert.deepEqual(extractCompletionReference("ds."), {
@@ -154,5 +155,54 @@ test("resolveKnownHostTypeExpression recognizes alias-expanded host types", () =
   assert.equal(
     resolveKnownHostTypeExpression("xr.Dataset", { xr: "xarray" }),
     "xarray.Dataset"
+  );
+});
+
+test("buildCombinedNotebookSource includes earlier python cells and maps the active line", () => {
+  const combined = buildCombinedNotebookSource(
+    [
+      {
+        kind: "code",
+        languageId: "python",
+        text: "import xarray as xr"
+      },
+      {
+        kind: "markup",
+        languageId: "markdown",
+        text: "## Notes"
+      },
+      {
+        kind: "code",
+        languageId: "python",
+        text: "ds = xr.Dataset()\nds.cf."
+      }
+    ],
+    2
+  );
+
+  assert.deepEqual(combined, {
+    source: "import xarray as xr\n\nds = xr.Dataset()\nds.cf.",
+    lineOffset: 2
+  });
+});
+
+test("buildCombinedNotebookSource returns null when the active cell is not python code", () => {
+  assert.equal(
+    buildCombinedNotebookSource(
+      [
+        {
+          kind: "code",
+          languageId: "python",
+          text: "import xarray as xr"
+        },
+        {
+          kind: "markup",
+          languageId: "markdown",
+          text: "## Notes"
+        }
+      ],
+      1
+    ),
+    null
   );
 });
